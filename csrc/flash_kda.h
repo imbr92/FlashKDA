@@ -22,4 +22,6 @@ void fwd(
     std::optional<torch::stable::Tensor> final_state = std::nullopt,
     std::optional<torch::stable::Tensor> cu_seqlens = std::nullopt,
     std::optional<torch::stable::Tensor> checkpoint_state = std::nullopt,
-    std::optional<torch::stable::Tensor> checkpoint_offsets = std::nullopt);
+    std::optional<torch::stable::Tensor> checkpoint_offsets = std::nullopt,
+    std::optional<torch::stable::Tensor> beta_transposed = std::nullopt,
+    std::optional<torch::stable::Tensor> state_slot_ids = std::nullopt);

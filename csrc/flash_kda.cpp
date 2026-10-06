@@ -2,6 +2,8 @@
 #include <torch/csrc/stable/ops.h>
 #include <torch/csrc/stable/tensor_inl.h>
 
+#include <cstdint>
+
 #include "flash_kda.h"
 #include "fwd.h"
 
@@ -44,12 +46,14 @@ void fwd(
     std::optional<Tensor> final_state,
     std::optional<Tensor> cu_seqlens,
     std::optional<Tensor> checkpoint_state,
-    std::optional<Tensor> checkpoint_offsets
+    std::optional<Tensor> checkpoint_offsets,
+    std::optional<Tensor> beta_transposed,
+    std::optional<Tensor> state_slot_ids
 ) {
     STD_TORCH_CHECK(q.is_cuda() && k.is_cuda() && v.is_cuda() && g.is_cuda() && beta.is_cuda() && out.is_cuda() && workspace.is_cuda(),
                     "all tensors must be on CUDA");
-    STD_TORCH_CHECK(q.is_contiguous() && k.is_contiguous() && v.is_contiguous() && g.is_contiguous() && out.is_contiguous() && workspace.is_contiguous(),
-                    "q, k, v, g, out, and workspace must be contiguous");
+    STD_TORCH_CHECK(out.is_contiguous() && workspace.is_contiguous(),
+                    "out and workspace must be contiguous");
     STD_TORCH_CHECK(q.scalar_type() == ScalarType::BFloat16, "q must be bfloat16");
     STD_TORCH_CHECK(k.scalar_type() == ScalarType::BFloat16, "k must be bfloat16");
     STD_TORCH_CHECK(v.scalar_type() == ScalarType::BFloat16, "v must be bfloat16");
@@ -141,6 +145,33 @@ void fwd(
 
     STD_TORCH_CHECK(D == 128, "currently only supports D == 128");
 
+    auto check_input_layout = [&](const Tensor& tensor, const char* name) {
+        STD_TORCH_CHECK(
+            tensor.stride(3) == 1 && tensor.stride(2) == D,
+            name, " must be dense in its head and feature dimensions");
+        STD_TORCH_CHECK(
+            tensor.stride(1) >= H * D,
+            name, " token stride must not overlap adjacent rows");
+        STD_TORCH_CHECK(
+            B == 1 || tensor.stride(0) == T_seq * tensor.stride(1),
+            name, " must have a uniform token stride across batches");
+        STD_TORCH_CHECK(
+            reinterpret_cast<uintptr_t>(tensor.const_data_ptr()) % 16 == 0,
+            name, " base address must be 16-byte aligned for TMA");
+        STD_TORCH_CHECK(
+            tensor.stride(1) * sizeof(cutlass::bfloat16_t) % 16 == 0,
+            name, " token stride must be 16-byte aligned for TMA");
+    };
+    check_input_layout(q, "q");
+    check_input_layout(k, "k");
+    check_input_layout(v, "v");
+    check_input_layout(g, "g");
+
+    int64_t q_token_stride = q.stride(1);
+    int64_t k_token_stride = k.stride(1);
+    int64_t v_token_stride = v.stride(1);
+    int64_t g_token_stride = g.stride(1);
+
     auto q_ptr = reinterpret_cast<cutlass::bfloat16_t const*>(q.const_data_ptr());
     auto k_ptr = reinterpret_cast<cutlass::bfloat16_t const*>(k.const_data_ptr());
     auto v_ptr = reinterpret_cast<cutlass::bfloat16_t const*>(v.const_data_ptr());
@@ -151,11 +182,32 @@ void fwd(
     auto dt_bias_ptr = reinterpret_cast<float const*>(dt_bias.const_data_ptr());
     float gate_scale = float(lower_bound * 1.4426950408889634);
 
-    // Transpose beta: [B, T, H] -> [H, B*T] in one materialization.
-    Tensor beta_bht = torch::stable::transpose(beta, 1, 2);
-    Tensor beta_hbt = torch::stable::transpose(beta_bht, 0, 1);
-    Tensor beta_t = torch::stable::contiguous(beta_hbt);
-    auto beta_t_ptr = reinterpret_cast<cutlass::bfloat16_t const*>(beta_t.const_data_ptr());
+    std::optional<Tensor> owned_beta_transposed;
+    cutlass::bfloat16_t const* beta_t_ptr;
+    if (beta_transposed.has_value()) {
+        auto& beta_t = beta_transposed.value();
+        STD_TORCH_CHECK(
+            beta_t.is_cuda() && beta_t.is_contiguous(),
+            "beta_transposed must be a contiguous CUDA tensor");
+        STD_TORCH_CHECK(
+            beta_t.scalar_type() == ScalarType::BFloat16,
+            "beta_transposed must be bfloat16");
+        STD_TORCH_CHECK(
+            beta_t.dim() == 2 && beta_t.size(0) == H && beta_t.size(1) == T_total,
+            "beta_transposed must have shape [H, B*T]");
+        STD_TORCH_CHECK(
+            reinterpret_cast<uintptr_t>(beta_t.const_data_ptr()) % 16 == 0,
+            "beta_transposed base address must be 16-byte aligned for TMA");
+        beta_t_ptr = reinterpret_cast<cutlass::bfloat16_t const*>(
+            beta_t.const_data_ptr());
+    } else {
+        // Transpose beta: [B, T, H] -> [H, B*T] in one materialization.
+        Tensor beta_bht = torch::stable::transpose(beta, 1, 2);
+        Tensor beta_hbt = torch::stable::transpose(beta_bht, 0, 1);
+        owned_beta_transposed.emplace(torch::stable::contiguous(beta_hbt));
+        beta_t_ptr = reinterpret_cast<cutlass::bfloat16_t const*>(
+            owned_beta_transposed->const_data_ptr());
+    }
 
     auto workspace_ptr = workspace.mutable_data_ptr();
 
@@ -196,6 +248,26 @@ void fwd(
         N_val = B;
     }
 
+    bool has_state_slots = state_slot_ids.has_value();
+    int64_t const* state_slot_ids_ptr = nullptr;
+    if (has_state_slots) {
+        auto& slots = state_slot_ids.value();
+        STD_TORCH_CHECK(
+            has_state_in || has_state_out,
+            "state_slot_ids requires initial_state or final_state");
+        STD_TORCH_CHECK(
+            slots.is_cuda() && slots.is_contiguous(),
+            "state_slot_ids must be a contiguous CUDA tensor");
+        STD_TORCH_CHECK(
+            slots.scalar_type() == ScalarType::Long,
+            "state_slot_ids must be int64");
+        STD_TORCH_CHECK(
+            slots.dim() == 1 && slots.size(0) == N_val,
+            "state_slot_ids must have shape [N]");
+        state_slot_ids_ptr = reinterpret_cast<int64_t const*>(
+            slots.const_data_ptr());
+    }
+
     int num_sms = 0;
     cudaError_t attr_status = cudaDeviceGetAttribute(
         &num_sms,
@@ -206,18 +278,31 @@ void fwd(
         "failed to query CUDA multiprocessor count: ",
         cudaGetErrorString(attr_status));
 
-    // Validate state shapes: always [N, H, D, D]
+    int64_t state_rows = N_val;
+    if (has_state_slots) {
+        state_rows = has_state_in ? initial_state->size(0) : final_state->size(0);
+        STD_TORCH_CHECK(state_rows > 0, "state pools must contain at least one row");
+        if (has_state_in && has_state_out) {
+            STD_TORCH_CHECK(
+                initial_state->size(0) == final_state->size(0),
+                "initial_state and final_state pools must have the same row count");
+        }
+    }
+
+    // Validate compact states [N, H, D, D] or indexed pools [rows, H, D, D].
     if (has_state_in) {
         auto& is = initial_state.value();
-        STD_TORCH_CHECK(is.dim() == 4, "initial_state must be [N, H, D, D]");
-        STD_TORCH_CHECK(is.size(0) == N_val && is.size(1) == H && is.size(2) == D && is.size(3) == D,
-                        "initial_state must be [N, H, D, D]");
+        STD_TORCH_CHECK(
+            is.dim() == 4 && is.size(0) == state_rows && is.size(1) == H &&
+                is.size(2) == D && is.size(3) == D,
+            "initial_state has an invalid state shape");
     }
     if (has_state_out) {
         auto& fs = final_state.value();
-        STD_TORCH_CHECK(fs.dim() == 4, "final_state must be [N, H, D, D]");
-        STD_TORCH_CHECK(fs.size(0) == N_val && fs.size(1) == H && fs.size(2) == D && fs.size(3) == D,
-                        "final_state must be [N, H, D, D]");
+        STD_TORCH_CHECK(
+            fs.dim() == 4 && fs.size(0) == state_rows && fs.size(1) == H &&
+                fs.size(2) == D && fs.size(3) == D,
+            "final_state has an invalid state shape");
     }
     if (has_checkpoint) {
         auto& cs = checkpoint_state.value();
@@ -250,10 +335,12 @@ void fwd(
         #define LAUNCH(HI, HO, FP32, CKPT, VL) \
             launch_fwd<128, HI, HO, FP32, CKPT, VL>( \
                 q_ptr, k_ptr, v_ptr, g_ptr, beta_t_ptr, \
+                q_token_stride, k_token_stride, v_token_stride, g_token_stride, \
                 initial_state_raw, scale_f, final_state_raw, \
                 checkpoint_state_raw, typed_checkpoint_offsets, out_ptr, \
                 workspace_ptr, total_tiles, \
-                int(T_total), int(H), int(N_val), typed_cu_seqlens, \
+                int(T_total), int(H), int(N_val), int(state_rows), \
+                state_slot_ids_ptr, typed_cu_seqlens, \
                 A_log_ptr, dt_bias_ptr, gate_scale, num_sms, stream)
 
         #define DISPATCH_STATE(CKPT, VL) \

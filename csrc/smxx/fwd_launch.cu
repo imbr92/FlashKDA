@@ -19,6 +19,10 @@ void launch_fwd(
     cutlass::bfloat16_t const* v_ptr,
     cutlass::bfloat16_t const* g_bf16_ptr,
     cutlass::bfloat16_t const* beta_ptr,
+    int64_t q_token_stride,
+    int64_t k_token_stride,
+    int64_t v_token_stride,
+    int64_t g_token_stride,
     void const* initial_state_ptr,
     float scale,
     void* final_state_ptr,
@@ -30,6 +34,8 @@ void launch_fwd(
     int T_total,
     int H,
     int N,
+    int state_rows,
+    int64_t const* state_slot_ids_ptr,
     SeqlenT const* cu_seqlens_ptr,
     float const* A_log_ptr,
     float const* dt_bias_ptr,
@@ -74,15 +80,25 @@ void launch_fwd(
         typename K2VSplitL::TMAFP32StateSmemLayout;
 
     // --- gmem layouts for original tensors
-    auto gmem_layout = make_layout(make_shape(H, T_total, D), make_stride(D, D * H, 1));
+    auto q_gmem_layout = make_layout(
+        make_shape(H, T_total, D), make_stride(D, q_token_stride, 1));
+    auto k_gmem_layout = make_layout(
+        make_shape(H, T_total, D), make_stride(D, k_token_stride, 1));
+    auto v_gmem_layout = make_layout(
+        make_shape(H, T_total, D), make_stride(D, v_token_stride, 1));
+    auto g_gmem_layout = make_layout(
+        make_shape(H, T_total, D), make_stride(D, g_token_stride, 1));
+    auto out_gmem_layout = make_layout(
+        make_shape(H, T_total, D), make_stride(D, D * H, 1));
     // 1D beta layout: [H*T] contiguous
     auto beta_gmem_layout = make_layout(make_shape(H * T_total));
-    auto state_gmem_layout = make_layout(make_shape(N * H, D, D), LayoutRight{});
+    auto state_gmem_layout = make_layout(
+        make_shape(state_rows * H, D, D), LayoutRight{});
 
-    Tensor m_q   = make_tensor(make_gmem_ptr(q_ptr), gmem_layout);
-    Tensor m_k   = make_tensor(make_gmem_ptr(k_ptr), gmem_layout);
-    Tensor m_v   = make_tensor(make_gmem_ptr(v_ptr), gmem_layout);
-    Tensor m_out = make_tensor(make_gmem_ptr(out_ptr), gmem_layout);
+    Tensor m_q   = make_tensor(make_gmem_ptr(q_ptr), q_gmem_layout);
+    Tensor m_k   = make_tensor(make_gmem_ptr(k_ptr), k_gmem_layout);
+    Tensor m_v   = make_tensor(make_gmem_ptr(v_ptr), v_gmem_layout);
+    Tensor m_out = make_tensor(make_gmem_ptr(out_ptr), out_gmem_layout);
     Tensor m_beta = make_tensor(make_gmem_ptr<BF16>(beta_ptr), beta_gmem_layout);
 
     // --- Workspace gmem layouts (separated arrays)
@@ -100,7 +116,7 @@ void launch_fwd(
     auto tma_load_k    = make_tma_copy(SM90_TMA_LOAD{}, m_k, TMAQKLayout{});
     auto tma_load_beta = make_tma_copy(SM90_TMA_LOAD{}, m_beta, TMABetaSmemLayout{});
 
-    Tensor m_g = make_tensor(make_gmem_ptr(g_bf16_ptr), gmem_layout);
+    Tensor m_g = make_tensor(make_gmem_ptr(g_bf16_ptr), g_gmem_layout);
     auto tma_load_g = make_tma_copy(SM90_TMA_LOAD{}, m_g, TMAQKLayout{});
 
     auto dt_bias_gmem_layout = make_layout(make_shape(H, D), LayoutRight{});
@@ -234,7 +250,8 @@ void launch_fwd(
                     tma_store_final_state_vsplit,
                     tma_store_out_vsplit,
                     out_ptr, checkpoint_state_ptr, checkpoint_offsets_ptr,
-                    T_total, H, N, cu_seqlens_ptr, total_tiles,
+                    T_total, H, N, state_rows, state_slot_ids_ptr,
+                    cu_seqlens_ptr, total_tiles,
                     ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk);
                 return;
             }
@@ -265,7 +282,8 @@ void launch_fwd(
             tma_store_final_state,
             tma_store_out,
             out_ptr, checkpoint_state_ptr, checkpoint_offsets_ptr,
-            T_total, H, N, cu_seqlens_ptr, total_tiles,
+            T_total, H, N, state_rows, state_slot_ids_ptr,
+            cu_seqlens_ptr, total_tiles,
             ws_kd, ws_qd, ws_kr, ws_gt, ws_inv, ws_mqk
         );
     }
@@ -277,9 +295,11 @@ void launch_fwd(
     template void launch_fwd<D, HI, HO, FP32, CKPT, VL, SEQLEN_T>( \
         cutlass::bfloat16_t const*, cutlass::bfloat16_t const*, \
         cutlass::bfloat16_t const*, cutlass::bfloat16_t const*, \
-        cutlass::bfloat16_t const*, void const*, float, void*, \
+        cutlass::bfloat16_t const*, \
+        int64_t, int64_t, int64_t, int64_t, \
+        void const*, float, void*, \
         void*, SEQLEN_T const*, cutlass::bfloat16_t*, void*, \
-        int, int, int, int, \
+        int, int, int, int, int, int64_t const*, \
         SEQLEN_T const*, float const*, float const*, float, int, \
         cudaStream_t);
 

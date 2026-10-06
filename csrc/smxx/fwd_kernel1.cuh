@@ -188,11 +188,15 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
         auto cta_tma_load_k = tma_load_k.get_slice(Int<0>{});
         auto cta_tma_load_beta = tma_load_beta.get_slice(Int<0>{});
 
-        auto qk_off = g_q.layout()(head_idx, int(bos) + local_t * CHUNK, 0);
+        auto q_off = g_q.layout()(head_idx, int(bos) + local_t * CHUNK, 0);
+        auto k_off = g_k.layout()(head_idx, int(bos) + local_t * CHUNK, 0);
         auto tile_shape_3d = make_shape(Int<1>{}, Int<CHUNK>{}, Int<D>{});
-        auto tile_stride_3d = stride(g_q.layout());
-        Tensor g_q_tile = make_tensor(g_q.data() + qk_off, make_layout(tile_shape_3d, tile_stride_3d));
-        Tensor g_k_tile = make_tensor(g_k.data() + qk_off, make_layout(tile_shape_3d, tile_stride_3d));
+        Tensor g_q_tile = make_tensor(
+            g_q.data() + q_off,
+            make_layout(tile_shape_3d, stride(g_q.layout())));
+        Tensor g_k_tile = make_tensor(
+            g_k.data() + k_off,
+            make_layout(tile_shape_3d, stride(g_k.layout())));
 
         int beta_linear = head_idx * T_total + (int(bos) + local_t * CHUNK);
         int beta_aligned = beta_linear & ~7;
@@ -213,7 +217,10 @@ __global__ void __launch_bounds__(NumThreads, 8) _flash_kda_fwd_prepare(
         // TMA load g_bf16 (same gmem layout as q/k)
         Tensor g_g = tma_load_g.get_tma_tensor(make_shape(H, T_total, D));
         auto cta_tma_load_g = tma_load_g.get_slice(Int<0>{});
-        Tensor g_g_tile = make_tensor(g_g.data() + qk_off, make_layout(tile_shape_3d, tile_stride_3d));
+        auto g_off = g_g.layout()(head_idx, int(bos) + local_t * CHUNK, 0);
+        Tensor g_g_tile = make_tensor(
+            g_g.data() + g_off,
+            make_layout(tile_shape_3d, stride(g_g.layout())));
         Tensor s_g_bf16_tile = make_tensor(make_smem_ptr(shared_storage.g_bf16.begin()), TMAQKLayout{});
         cute::copy(tma_load_g.with(reinterpret_cast<BarrierType&>(shared_storage.tma_load_barrier)),
             cta_tma_load_g.partition_S(g_g_tile), cta_tma_load_g.partition_D(s_g_bf16_tile));
