@@ -1,10 +1,12 @@
+import pytest
 import torch
 
 import flash_kda
 
 
 @torch.inference_mode()
-def test_strided_inputs_indexed_state_pool_and_cuda_graph():
+@pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+def test_strided_inputs_indexed_state_pool_and_cuda_graph(state_dtype):
     torch.manual_seed(19)
     tokens, heads, dim, pool_rows = 48, 2, 128, 5
     packed = torch.randn(tokens, 4 * heads * dim + 64, device="cuda", dtype=torch.bfloat16)
@@ -17,7 +19,7 @@ def test_strided_inputs_indexed_state_pool_and_cuda_graph():
     dt_bias = torch.randn(heads, dim, device="cuda", dtype=torch.float32)
     cu_seqlens = torch.tensor([0, 31, 41, tokens], device="cuda", dtype=torch.int32)
     state_slot_ids = torch.tensor([3, -1, 1], device="cuda", dtype=torch.int64)
-    original = torch.randn(pool_rows, heads, dim, dim, device="cuda", dtype=torch.float32)
+    original = torch.randn(pool_rows, heads, dim, dim, device="cuda", dtype=state_dtype)
 
     expected_out = torch.empty_like(q)
     expected_state = torch.stack((original[3], torch.zeros_like(original[0]), original[1]))
