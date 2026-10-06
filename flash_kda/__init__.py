@@ -22,6 +22,8 @@ def fwd(
     final_state=None,
     cu_seqlens=None,
     workspace=None,
+    beta_transposed=None,
+    state_slot_ids=None,
 ):
     """FlashKDA forward (Flash Kimi Delta Attention).
 
@@ -47,10 +49,18 @@ def fwd(
             or int64, shape ``[N+1]``. When provided, ``B`` must be 1.
         workspace (torch.Tensor, optional): Reusable uint8 workspace. Allocated
             automatically when omitted.
+        beta_transposed (torch.Tensor, optional): Caller-owned contiguous beta
+            transpose with shape ``[H, B*T]``. Supplying it avoids an internal
+            allocation and is required for allocation-free graph capture.
+        state_slot_ids (torch.Tensor, optional): Int64 row ids with shape
+            ``[N]`` mapping packed sequences into state pools. Negative ids
+            read zero state and skip the final-state write.
     Notes:
         * Currently requires ``K = V = 128``.
-        * Beta may be strided; other input and output tensors must be
-          contiguous.
+        * Q, K, V, g, and beta may use aligned token strides. Their head and
+          feature dimensions must remain dense. Output stays contiguous.
+        * With ``state_slot_ids``, state tensors are pools shaped
+          ``[pool_rows, H, V, K]`` instead of compact ``[N, H, V, K]`` tensors.
     """
     B, T_seq, H = q.shape[:3]
     N = cu_seqlens.numel() - 1 if cu_seqlens is not None else B
@@ -76,4 +86,6 @@ def fwd(
         initial_state=initial_state,
         final_state=final_state,
         cu_seqlens=cu_seqlens,
+        beta_transposed=beta_transposed,
+        state_slot_ids=state_slot_ids,
     )

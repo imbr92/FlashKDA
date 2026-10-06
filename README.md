@@ -84,7 +84,7 @@ bash tests/test.sh
 ```python
 flash_kda.fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound,
               initial_state=None, final_state=None, cu_seqlens=None,
-              workspace=None)
+              workspace=None, beta_transposed=None, state_slot_ids=None)
 ```
 
 **Parameters:**
@@ -105,11 +105,20 @@ flash_kda.fwd(q, k, v, g, beta, scale, out, A_log, dt_bias, lower_bound,
 | `final_state` | bf16/fp32/None | `[B, H, V, K]` or `[N, H, V, K]` | (optional, output) Final recurrent state |
 | `cu_seqlens` | int32/int64 | `[N+1]` | (optional) Cumulative sequence lengths for variable-length batching |
 | `workspace` | uint8/None | `[workspace_size]` | (optional) Reusable workspace; allocated automatically when omitted |
+| `beta_transposed` | bf16/None | `[H, B*T]` | (optional) Caller-owned transposed beta buffer; avoids an internal allocation |
+| `state_slot_ids` | int64/None | `[N]` | (optional) Maps logical sequences to rows in persistent state pools |
 
 - Currently requires `K = V = 128`.
+- Q, K, V, and g may have independent, TMA-aligned token strides. Their head
+  and feature dimensions must remain dense; `out` remains contiguous.
 - `initial_state` / `final_state` accept `None` (stateless), bf16, or fp32 tensors. When both are provided, their dtypes must match.
 - When `cu_seqlens` is provided, `B` must be 1, `T` is the total length across all sequences, and `initial_state` / `final_state` have shape `[N, H, V, K]`.
 - When `cu_seqlens` is `None`, each batch element is treated as an independent sequence, and the state shape is `[B, H, V, K]`.
+- When `state_slot_ids` is provided, state tensors are pools shaped
+  `[pool_rows, H, V, K]`. Negative row IDs read zero state and skip the final
+  write. Active non-negative row IDs must be unique and in range.
+- Supplying `workspace` and `beta_transposed` makes the call allocation-free
+  and suitable for CUDA graph capture.
 - K2 automatically splits the value dimension into two `V=64` CTAs when
   `2 * H * N <= SM count`, targeting workloads with insufficient CTA-level
   parallelism.
